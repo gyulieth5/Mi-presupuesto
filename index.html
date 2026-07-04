@@ -118,8 +118,11 @@ function defaultState(){
     month: ml.charAt(0).toUpperCase()+ml.slice(1),
     income:[],fixed:[],variable:[],debts:[],
     savingsPercent:10,investPercent:10,
+    savingsBalance:0,    // total ahorrado antes de usar la app
+    investBalance:0,     // total invertido antes de usar la app
+    investItems:[],      // desglose de inversiones por plataforma
     emergency:{targetMonths:3,current:0},
-    project:{name:'',target:0,current:0,targetDate:'',monthlyPlanned:0},
+    projects:[],
     // Ingresos por trimestre (Q1-Q4 del año próximo)
     scenarios:[
       {label:'Trimestre 1 (Ene–Mar)',amount:0},
@@ -144,9 +147,18 @@ function loadState(){
     if(!raw) return;
     const p = JSON.parse(raw);
     state = Object.assign(defaultState(), p);
-    ['income','fixed','variable','debts'].forEach(k=>{ state[k]=p[k]||[]; });
+    ['income','fixed','variable','debts','investItems'].forEach(k=>{ state[k]=p[k]||[]; });
+    state.savingsBalance = Number(p.savingsBalance)||0;
+    state.investBalance  = Number(p.investBalance)||0;
     state.emergency = Object.assign({targetMonths:3,current:0}, p.emergency||{});
-    state.project = Object.assign({name:'',target:0,current:0,targetDate:'',monthlyPlanned:0}, p.project||{});
+    // migración: si venía un solo project (versión vieja), lo convertimos a array
+    if(p.projects && Array.isArray(p.projects)){
+      state.projects = p.projects;
+    } else if(p.project && p.project.name){
+      state.projects = [Object.assign({id:uid()}, p.project)];
+    } else {
+      state.projects = [];
+    }
     state.scenarios = p.scenarios || defaultState().scenarios;
   }catch(e){}
 }
@@ -247,7 +259,7 @@ function computeTotals(){
   const totalVarSpent = sum(state.variable,'spent');
   const savingsAmt = totalIncome*(Number(state.savingsPercent)||0)/100;
   const investAmt  = totalIncome*(Number(state.investPercent)||0)/100;
-  const projMonthly = Number(state.project.monthlyPlanned)||0;
+  const projMonthly = (state.projects||[]).reduce((a,p)=>a+(Number(p.monthlyPlanned)||0),0);
   const totalCommitted = totalFixed+totalDebts+savingsAmt+investAmt+projMonthly;
   const available = totalIncome-totalCommitted;
   const realRemaining = available-totalVarSpent;
@@ -295,7 +307,7 @@ function computeProjection(){
     const fixed = sum(state.fixed,'amount');
     const savings = income*(Number(state.savingsPercent)||0)/100;
     const invest  = income*(Number(state.investPercent)||0)/100;
-    const proj    = Number(state.project.monthlyPlanned)||0;
+    const proj    = (state.projects||[]).reduce((a,p)=>a+(Number(p.monthlyPlanned)||0),0);
     const committed = fixed+activeDebts+savings+invest+proj;
     const free = income-committed;
     months.push({label,income,committed,activeDebts,free,mo,yr});
@@ -313,8 +325,12 @@ function updateItem(list,id,field,val,isNum){
 function updateMonth(v){ state.month=v; scheduleSave(); }
 function updateSetting(f,v){ state[f]=parseNum(v)||0; scheduleSave();render(); }
 function updateEmergency(f,v){ state.emergency[f]=parseNum(v)||0; scheduleSave();render(); }
-function updateProject(f,v,isNum){ state.project[f]=isNum?(parseNum(v)||0):v; scheduleSave();render(); }
+function updateWealth(f,v){ state[f]=parseNum(v)||0; scheduleSave();render(); }
 function updateScenario(i,v){ state.scenarios[i].amount=parseNum(v)||0; scheduleSave();render(); }
+function updateProjectItem(id,f,v,isNum){
+  const p=(state.projects||[]).find(p=>p.id===id); if(!p) return;
+  p[f]=isNum?(parseNum(v)||0):v; scheduleSave();render();
+}
 function switchTab(t){ activeTab=t; render(); }
 
 /* ===================== SVG CHARTS ===================== */
@@ -475,14 +491,14 @@ function generateTips(t){
     else tips.push({l:'success',h:'Fondo de emergencia completo. Podés redirigir ese ahorro extra a inversión.'});
   }
   if(t.totalDebts>0&&Number(state.investPercent)>0) tips.push({l:'tip',h:'Con deudas activas, conviene cancelar primero las de mayor interés antes de invertir más.'});
-  const pr=state.project;
-  if(pr.target>0){
-    const falta=Math.max(0,pr.target-pr.current);
-    if(falta===0) tips.push({l:'success',h:`¡Meta "${esc(pr.name||'proyecto')}" alcanzada!`});
-    else{
+  const prs=state.projects||[];
+  if(prs.length>0){
+    prs.forEach(pr=>{
+      const falta=Math.max(0,(Number(pr.target)||0)-(Number(pr.current)||0));
+      if(falta===0){ tips.push({l:'success',h:`¡Meta "${esc(pr.name||'proyecto')}" alcanzada!`}); return; }
       const meses=monthsBetween(pr.targetDate);
-      if(meses>0){ const nec=falta/meses; tips.push(pr.monthlyPlanned<nec-1?{l:'alert',h:`Para llegar a tiempo necesitás <b>${fmt(nec)}/mes</b> (tenés ${fmt(pr.monthlyPlanned)}).`}:{l:'success',h:`Vas bien con "${esc(pr.name||'proyecto')}" a este ritmo.`}); }
-    }
+      if(meses>0){ const nec=falta/meses; tips.push(Number(pr.monthlyPlanned||0)<nec-1?{l:'alert',h:`Para llegar a tiempo a "${esc(pr.name||'proyecto')}" necesitás <b>${fmt(nec)}/mes</b> (tenés ${fmt(pr.monthlyPlanned)}).`}:{l:'success',h:`Vas bien con "${esc(pr.name||'proyecto')}" a este ritmo.`}); }
+    });
   }
   tips.push({l:'tip',h:'<b>Inversión:</b> completá el fondo de emergencia primero, diversificá, y aportá montos fijos periódicos en vez de adivinar el mercado.'});
   return tips;
@@ -660,16 +676,93 @@ function renderDeudas(t){
 
 /* ===================== AHORRO ===================== */
 function renderAhorro(t){
+  const savBal = Number(state.savingsBalance)||0;
+  const invBal = Number(state.investBalance)||0;
+  const invItems = state.investItems||[];
+
+  // Total invertido = balance previo + suma de ítems detallados (si los hay)
+  const invItemsTotal = invItems.reduce((a,i)=>a+(Number(i.amount)||0),0);
+  const invTotal = invItemsTotal > 0 ? invItemsTotal : invBal;
+
+  // Acumulado proyectado: saldo previo + aportes mensuales * meses desde hoy (estimación simple)
+  const savAcum = savBal + t.savingsAmt;
+  const invAcum = invTotal + t.investAmt;
+
+  const invRows = invItems.length ? invItems.map(it=>`<tr>
+    <td><input type="text" data-fk="invItems:${it.id}:name" value="${esc(it.name||'')}" placeholder="Ej: IoL, Binance…" oninput="updateItem('investItems','${it.id}','name',this.value,false)"></td>
+    <td><input type="text" data-fk="invItems:${it.id}:platform" value="${esc(it.platform||'')}" placeholder="Plataforma" oninput="updateItem('investItems','${it.id}','platform',this.value,false)"></td>
+    <td class="num"><input type="text" inputmode="decimal" data-fk="invItems:${it.id}:amount" value="${it.amount||''}" placeholder="0" oninput="updateItem('investItems','${it.id}','amount',this.value,true)"></td>
+    <td><button class="row-del" onclick="removeItem('investItems','${it.id}')">✕</button></td>
+  </tr>`).join('') : `<tr><td colspan="4"><div class="empty-state" style="padding:12px">Agregá tus inversiones actuales abajo.</div></td></tr>`;
+
   return `<h2 class="section-title">Ahorro e inversión</h2>
-  <p class="section-sub">Porcentaje del ingreso que se destina automáticamente a cada rubro.</p>
+  <p class="section-sub">Registrá lo que ya tenés acumulado y lo que sumás cada mes.</p>
+
   <div class="card">
+    <div class="card-title">Aportes mensuales automáticos</div>
     <div class="field-row">
-      <div class="field"><label>% Ahorro</label><input type="text" inputmode="numeric" data-fk="meta:sav" value="${state.savingsPercent}" oninput="updateSetting('savingsPercent',this.value)"></div>
-      <div class="field"><label>% Inversión</label><input type="text" inputmode="numeric" data-fk="meta:inv" value="${state.investPercent}" oninput="updateSetting('investPercent',this.value)"></div>
+      <div class="field"><label>% del ingreso a ahorro</label><input type="text" inputmode="numeric" data-fk="meta:sav" value="${state.savingsPercent}" oninput="updateSetting('savingsPercent',this.value)"></div>
+      <div class="field"><label>% del ingreso a inversión</label><input type="text" inputmode="numeric" data-fk="meta:inv" value="${state.investPercent}" oninput="updateSetting('investPercent',this.value)"></div>
     </div>
-    <div class="totals-line" style="border-top:none;margin-top:0;padding-top:0"><span>Ahorro mensual</span><span class="mono">${fmt(t.savingsAmt)}</span></div>
-    <div class="totals-line" style="border-top:none;padding-top:0"><span>Inversión mensual</span><span class="mono">${fmt(t.investAmt)}</span></div>
+    <div class="totals-line" style="border-top:none;margin-top:0;padding-top:0"><span>Ahorro mensual estimado</span><span class="mono">${fmt(t.savingsAmt)}</span></div>
+    <div class="totals-line" style="border-top:none;padding-top:0"><span>Inversión mensual estimada</span><span class="mono">${fmt(t.investAmt)}</span></div>
   </div>
+
+  <div class="card">
+    <div class="card-title">Saldo de ahorro acumulado</div>
+    <p style="font-size:12px;color:var(--text-dim);margin:0 0 12px">Todo lo que tenías ahorrado antes de empezar a usar esta app (caja de ahorro, efectivo, plazo fijo, etc.).</p>
+    <div class="field-row">
+      <div class="field"><label>Total ahorrado (saldo previo)</label><input type="text" inputmode="decimal" data-fk="meta:savBal" value="${state.savingsBalance||''}" placeholder="0" oninput="updateWealth('savingsBalance',this.value)"></div>
+    </div>
+    <div style="background:var(--sage-soft);border:1px solid #B7CFBD;border-radius:8px;padding:12px 16px;display:flex;justify-content:space-between;align-items:center">
+      <span style="font-size:13px;color:var(--sage)">Total ahorro (previo + este mes)</span>
+      <span style="font-family:'IBM Plex Mono',monospace;font-size:18px;font-weight:700;color:var(--sage)">${fmt(savAcum)}</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Inversiones actuales por plataforma</div>
+    <p style="font-size:12px;color:var(--text-dim);margin:0 0 12px">Cargá lo que ya tenés invertido antes de usar la app — IoL, Bullmarket, Binance, etc. Si preferís un total global usá el campo de abajo; si querés el desglose usá la tabla.</p>
+
+    <table class="ledger">
+      <thead><tr><th>Descripción / activo</th><th>Plataforma</th><th style="text-align:right">Monto actual</th><th></th></tr></thead>
+      <tbody>${invRows}</tbody>
+    </table>
+    <button class="add-row-btn" onclick="addItem('investItems',{name:'',platform:'',amount:0})">+ Agregar inversión</button>
+
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line)">
+      <div style="font-size:11.5px;color:var(--text-dim);margin-bottom:6px">O si preferís un total sin desglose:</div>
+      <div class="field-row">
+        <div class="field"><label>Total invertido global (saldo previo)</label><input type="text" inputmode="decimal" data-fk="meta:invBal" value="${state.investBalance||''}" placeholder="0" oninput="updateWealth('investBalance',this.value)" ${invItems.length?'disabled style="opacity:.4;cursor:not-allowed"':''}></div>
+      </div>
+      ${invItems.length?`<div style="font-size:11px;color:var(--text-dim)">Deshabilitado porque ya usás el desglose por plataforma.</div>`:''}
+    </div>
+
+    <div style="background:#FBF1DC;border:1px solid var(--gold-soft);border-radius:8px;padding:12px 16px;margin-top:12px;display:flex;justify-content:space-between;align-items:center">
+      <span style="font-size:13px;color:#7A5A00">Total invertido (previo + este mes)</span>
+      <span style="font-family:'IBM Plex Mono',monospace;font-size:18px;font-weight:700;color:#7A5A00">${fmt(invAcum)}</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Patrimonio total estimado</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:var(--line);border-radius:8px;overflow:hidden">
+      <div style="background:var(--sage-soft);padding:14px 16px">
+        <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--sage);font-weight:600">Ahorro</div>
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:17px;font-weight:700;color:var(--sage);margin-top:4px">${fmt(savAcum)}</div>
+      </div>
+      <div style="background:#FBF1DC;padding:14px 16px">
+        <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#7A5A00;font-weight:600">Inversión</div>
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:17px;font-weight:700;color:#7A5A00;margin-top:4px">${fmt(invAcum)}</div>
+      </div>
+      <div style="background:var(--paper-dim);padding:14px 16px">
+        <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text-dim);font-weight:600">Total</div>
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:17px;font-weight:700;margin-top:4px">${fmt(savAcum+invAcum)}</div>
+      </div>
+    </div>
+    <div style="font-size:11px;color:var(--text-dim);margin-top:8px">Valores en pesos al momento del registro. No refleja rendimientos ni variaciones de precio.</div>
+  </div>
+
   <div class="card">
     <div class="card-title">Claves generales</div>
     <div class="tip tip">💡 Completá el fondo de emergencia antes de subir el % de inversión.</div>
@@ -699,28 +792,74 @@ function renderEmergencia(t){
 
 /* ===================== PROYECTO ===================== */
 function renderProyecto(t){
-  const pr=state.project;
-  const tgt=Number(pr.target)||0, cur=Number(pr.current)||0;
-  const prog=tgt>0?clamp((cur/tgt)*100,0,100):0;
-  const meses=monthsBetween(pr.targetDate);
-  const falta=Math.max(0,tgt-cur);
-  const nec=meses>0?falta/meses:null;
-  return `<h2 class="section-title">Proyecto de compra u obra</h2>
-  <p class="section-sub">Planificá una compra grande o construcción y calculá cuánto aportar por mes.</p>
-  <div class="card">
-    <div class="field-row">
-      <div class="field"><label>Nombre</label><input type="text" data-fk="meta:prN" value="${esc(pr.name)}" placeholder="Ej: Ampliación de cocina" oninput="updateProject('name',this.value,false)"></div>
-      <div class="field"><label>Fecha objetivo</label><input type="date" data-fk="meta:prD" value="${pr.targetDate}" oninput="updateProject('targetDate',this.value,false)"></div>
-    </div>
-    <div class="field-row">
-      <div class="field"><label>Costo total</label><input type="text" inputmode="decimal" data-fk="meta:prT" value="${pr.target}" oninput="updateProject('target',this.value,true)"></div>
-      <div class="field"><label>Ahorrado hasta ahora</label><input type="text" inputmode="decimal" data-fk="meta:prC" value="${pr.current}" oninput="updateProject('current',this.value,true)"></div>
-      <div class="field"><label>Aporte mensual planificado</label><input type="text" inputmode="decimal" data-fk="meta:prM" value="${pr.monthlyPlanned}" oninput="updateProject('monthlyPlanned',this.value,true)"></div>
-    </div>
-    <div class="progress-track"><div class="progress-fill" style="width:${prog}%"></div></div>
-    <div class="progress-label"><span>${fmt(cur)} de ${fmt(tgt)}</span><span>${pct(prog)}</span></div>
-    ${nec!==null?`<div class="totals-line"><span>Aporte necesario para llegar a tiempo</span><span class="mono">${fmt(nec)}</span></div>`:''}
-  </div>`;
+  const list = state.projects||[];
+  const totalAporte = list.reduce((a,p)=>a+(Number(p.monthlyPlanned)||0),0);
+
+  const cards = list.length ? list.map(pr=>{
+    const tgt=Number(pr.target)||0, cur=Number(pr.current)||0;
+    const prog=tgt>0?clamp((cur/tgt)*100,0,100):0;
+    const meses=monthsBetween(pr.targetDate);
+    const falta=Math.max(0,tgt-cur);
+    const nec=meses>0?falta/meses:null;
+    const done=tgt>0&&cur>=tgt;
+    const colores=['#9B6FB0','#4F7A5E','#C9A227','#7C8FC4','#E08C73','#B6452C'];
+    const colorIdx=list.indexOf(pr)%colores.length;
+    return `<div class="debt-card ${done?'done':''}">
+      <div class="debt-card-top">
+        <div class="debt-card-name" style="flex:1">
+          <input type="text" data-fk="proj:${pr.id}:name" value="${esc(pr.name||'')}" placeholder="Ej: Ampliación de cocina" oninput="updateProjectItem('${pr.id}','name',this.value,false)" style="font-size:14px;font-weight:700">
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          ${done?'<span class="finish-badge done">✅ Meta alcanzada</span>':''}
+          <button class="row-del" onclick="removeItem('projects','${pr.id}')">✕</button>
+        </div>
+      </div>
+      <div class="debt-meta">
+        <div class="debt-meta-item">
+          <label>Costo total estimado</label>
+          <input type="text" inputmode="decimal" data-fk="proj:${pr.id}:target" value="${pr.target||''}" placeholder="0" oninput="updateProjectItem('${pr.id}','target',this.value,true)">
+        </div>
+        <div class="debt-meta-item">
+          <label>Ahorrado hasta ahora</label>
+          <input type="text" inputmode="decimal" data-fk="proj:${pr.id}:current" value="${pr.current||''}" placeholder="0" oninput="updateProjectItem('${pr.id}','current',this.value,true)">
+        </div>
+        <div class="debt-meta-item">
+          <label>Aporte mensual</label>
+          <input type="text" inputmode="decimal" data-fk="proj:${pr.id}:monthlyPlanned" value="${pr.monthlyPlanned||''}" placeholder="0" oninput="updateProjectItem('${pr.id}','monthlyPlanned',this.value,true)">
+        </div>
+        <div class="debt-meta-item">
+          <label>Fecha objetivo</label>
+          <input type="date" data-fk="proj:${pr.id}:targetDate" value="${pr.targetDate||''}" oninput="updateProjectItem('${pr.id}','targetDate',this.value,false)">
+        </div>
+      </div>
+      <div class="progress-track"><div class="progress-fill" style="width:${prog}%;background:${done?'#4F7A5E':colores[colorIdx]}"></div></div>
+      <div class="progress-label">
+        <span>${fmt(cur)} de ${fmt(tgt)} &nbsp;·&nbsp; ${pct(prog)}</span>
+        <span>${falta>0?`Falta: <b>${fmt(falta)}</b>`:''}</span>
+      </div>
+      ${nec!==null&&!done?`<div style="margin-top:8px;font-size:12px;color:var(--text-dim)">
+        Para llegar a tiempo necesitás <b style="color:${Number(pr.monthlyPlanned||0)>=nec?'#4F7A5E':'#B6452C'}">${fmt(nec)}/mes</b>
+        ${Number(pr.monthlyPlanned||0)>=nec?' ✓ Vas bien':' — subí el aporte o mové la fecha'}
+      </div>`:''}
+    </div>`;
+  }).join('') : `<div class="empty-state">Todavía no tenés proyectos. Agregá el primero abajo.</div>`;
+
+  return `<h2 class="section-title">Proyectos de compra / obra</h2>
+  <p class="section-sub">Podés tener varios proyectos a la vez — cada uno con su meta, aporte mensual y fecha objetivo.</p>
+  ${cards}
+  <button class="add-row-btn" onclick="addItem('projects',{name:'',target:0,current:0,targetDate:'',monthlyPlanned:0})">+ Agregar proyecto</button>
+  ${list.length>1?`<div class="card" style="margin-top:16px">
+    <div class="card-title">Resumen de proyectos</div>
+    ${list.map(pr=>{
+      const tgt=Number(pr.target)||0,cur=Number(pr.current)||0;
+      const prog=tgt>0?clamp((cur/tgt)*100,0,100):0;
+      return `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-size:12.5px">
+        <span style="flex:1">${esc(pr.name||'Sin nombre')}</span>
+        <span style="font-family:'IBM Plex Mono',monospace;font-size:12px;margin-left:12px">${fmt(pr.monthlyPlanned)}/mes · ${pct(prog)}</span>
+      </div>`;
+    }).join('')}
+    <div class="totals-line"><span>Aporte mensual total a proyectos</span><span class="mono">${fmt(totalAporte)}</span></div>
+  </div>`:''}`;
 }
 
 /* ===================== GRÁFICOS ===================== */
@@ -817,6 +956,60 @@ function renderGraficos(t){
   </div>`;
 }
 
+/* ===================== EXPORTAR / IMPORTAR ===================== */
+function exportData(){
+  const json = JSON.stringify(state, null, 2);
+  const blob = new Blob([json], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const fecha = new Date().toLocaleDateString('es-AR').replace(/\//g,'-');
+  a.href = url;
+  a.download = `presupuesto-${fecha}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function importData(){
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json,application/json';
+  input.onchange = function(e){
+    const file = e.target.files[0];
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onload = function(ev){
+      try{
+        const parsed = JSON.parse(ev.target.result);
+        if(!parsed || typeof parsed !== 'object'){
+          alert('El archivo no tiene el formato correcto.');
+          return;
+        }
+        if(!confirm(`¿Importar los datos de "${file.name}"? Esto reemplazará los datos actuales en este dispositivo.`)) return;
+        state = Object.assign(defaultState(), parsed);
+        ['income','fixed','variable','debts','investItems'].forEach(k=>{ state[k]=parsed[k]||[]; });
+        state.savingsBalance = Number(parsed.savingsBalance)||0;
+        state.investBalance  = Number(parsed.investBalance)||0;
+        state.emergency = Object.assign({targetMonths:3,current:0}, parsed.emergency||{});
+        if(parsed.projects && Array.isArray(parsed.projects)){
+          state.projects = parsed.projects;
+        } else if(parsed.project && parsed.project.name){
+          state.projects = [Object.assign({id:uid()}, parsed.project)];
+        } else {
+          state.projects = [];
+        }
+        state.scenarios = parsed.scenarios || defaultState().scenarios;
+        scheduleSave();
+        render();
+        alert('✅ Datos importados correctamente.');
+      }catch(err){
+        alert('No se pudo leer el archivo. Asegurate de que sea un archivo exportado desde esta app.');
+      }
+    };
+    reader.readAsText(file);
+  };
+  input.click();
+}
+
 /* ===================== RENDER PRINCIPAL ===================== */
 function renderTabContent(t){
   switch(activeTab){
@@ -848,8 +1041,13 @@ function render(){
   loadState();
   render();
   document.body.insertAdjacentHTML('beforeend',`
-    <div style="position:fixed;bottom:12px;right:14px;z-index:50">
-      <button onclick="resetAll()" style="background:#fff;border:1px solid var(--line);color:#9c958a;padding:5px 10px;border-radius:6px;font-size:10.5px;box-shadow:0 2px 8px rgba(0,0,0,.1);cursor:pointer">Borrar todos los datos</button>
+    <div style="position:fixed;bottom:0;left:0;right:0;z-index:50;background:rgba(22,33,62,0.96);backdrop-filter:blur(8px);padding:8px 20px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;border-top:1px solid rgba(250,246,239,0.1)">
+      <span style="font-size:10.5px;color:rgba(250,246,239,0.45);font-family:'IBM Plex Mono',monospace">Los datos se guardan en este navegador</span>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button onclick="importData()" style="background:rgba(250,246,239,0.1);border:1px solid rgba(250,246,239,0.2);color:rgba(250,246,239,0.85);padding:6px 13px;border-radius:6px;font-size:11.5px;font-weight:600;cursor:pointer" title="Cargar datos desde otro dispositivo">⬆ Importar</button>
+        <button onclick="exportData()" style="background:#C9A227;border:none;color:#16213E;padding:6px 13px;border-radius:6px;font-size:11.5px;font-weight:700;cursor:pointer" title="Guardar copia para llevar a otro dispositivo">⬇ Exportar copia</button>
+        <button onclick="resetAll()" style="background:transparent;border:1px solid rgba(182,69,44,0.4);color:rgba(182,69,44,0.7);padding:6px 10px;border-radius:6px;font-size:11px;cursor:pointer">Borrar todo</button>
+      </div>
     </div>`);
 })();
 </script>
