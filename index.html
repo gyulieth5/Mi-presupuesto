@@ -109,6 +109,77 @@ svg.chart{display:block;width:100%;max-width:100%;}
 <script>
 /* ===================== STORAGE KEY ===================== */
 const STORAGE_KEY = 'budget-v2';
+const HISTORY_KEY = 'budget-history-v1';
+
+let history = []; // array de meses archivados
+
+function loadHistory(){
+  try{
+    const raw = localStorage.getItem(HISTORY_KEY);
+    if(raw) history = JSON.parse(raw);
+  }catch(e){ history=[]; }
+}
+function saveHistory(){
+  try{ localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); }catch(e){}
+}
+
+function closeMonth(){
+  const t = computeTotals();
+  const confirm1 = confirm(`¿Cerrar el mes de ${state.month} y empezar uno nuevo?\n\nSe guardará en el historial:\n• Ingresos: ${fmt(t.totalIncome)}\n• Gastos fijos: ${fmt(t.totalFixed)}\n• Variables gastado: ${fmt(t.totalVarSpent)}\n• Disponible: ${fmt(t.realRemaining)}\n\nLos gastos fijos, deudas, proyectos, ahorro e inversión se mantienen para el mes nuevo.`);
+  if(!confirm1) return;
+
+  // Archivar snapshot del mes actual
+  const snapshot = {
+    month: state.month,
+    archivedAt: new Date().toISOString(),
+    income: JSON.parse(JSON.stringify(state.income)),
+    fixed: JSON.parse(JSON.stringify(state.fixed)),
+    variable: JSON.parse(JSON.stringify(state.variable)),
+    debts: JSON.parse(JSON.stringify(state.debts)),
+    savingsPercent: state.savingsPercent,
+    investPercent: state.investPercent,
+    savingsBalance: state.savingsBalance,
+    investBalance: state.investBalance,
+    investItems: JSON.parse(JSON.stringify(state.investItems||[])),
+    emergency: JSON.parse(JSON.stringify(state.emergency)),
+    projects: JSON.parse(JSON.stringify(state.projects||[])),
+    totals: {
+      income: t.totalIncome, fixed: t.totalFixed, debts: t.totalDebts,
+      varSpent: t.totalVarSpent, savings: t.savingsAmt, invest: t.investAmt,
+      committed: t.totalCommitted, remaining: t.realRemaining
+    }
+  };
+  history.unshift(snapshot); // más reciente primero
+  saveHistory();
+
+  // Nuevo mes: limpiar ingresos y gastos variables, avanzar cuotas pagadas
+  const now = new Date();
+  const nextMonth = new Date(now.getFullYear(), now.getMonth()+1, 1);
+  const newMonthLabel = nextMonth.toLocaleDateString('es-AR',{month:'long',year:'numeric'});
+  state.month = newMonthLabel.charAt(0).toUpperCase()+newMonthLabel.slice(1);
+  state.income = [];
+  state.variable = (state.variable||[]).map(v=>({...v, spent:0})); // reset gastado, mantiene categorías y presupuesto
+  // deudas fijo: reset pagado
+  state.debts = (state.debts||[]).map(d=>({...d, paid:false}));
+  // Actualizar saldo de ahorro e inversión sumando el aporte del mes
+  state.savingsBalance = (Number(state.savingsBalance)||0) + t.savingsAmt;
+  const invItemsTotal = (state.investItems||[]).reduce((a,i)=>a+(Number(i.amount)||0),0);
+  if(invItemsTotal>0){
+    // Distribuir el aporte de inversión proporcionalmente entre los ítems existentes
+    // (o simplemente sumarlo al primero si hay uno solo)
+    if(state.investItems.length===1){
+      state.investItems[0].amount = (Number(state.investItems[0].amount)||0) + t.investAmt;
+    }
+    // si hay varios, el usuario lo distribuye manualmente
+  } else {
+    state.investBalance = (Number(state.investBalance)||0) + t.investAmt;
+  }
+
+  scheduleSave();
+  activeTab = 'resumen';
+  render();
+  alert(`✅ Mes de ${snapshot.month} archivado. Ahora estás en ${state.month}.`);
+}
 
 /* ===================== STATE ===================== */
 function defaultState(){
@@ -142,6 +213,7 @@ function uid(){ return 'i'+Math.random().toString(36).slice(2,10); }
 
 /* ===================== STORAGE ===================== */
 function loadState(){
+  loadHistory();
   try{
     const raw = localStorage.getItem(STORAGE_KEY);
     if(!raw) return;
@@ -173,9 +245,9 @@ function scheduleSave(){
 }
 function renderSaveStatus(){ const el=document.getElementById('sv'); if(el) el.textContent=saveStatusText; }
 function resetAll(){
-  if(!confirm('¿Borrar todos los datos? Esta acción no se puede deshacer.')) return;
-  try{ localStorage.removeItem(STORAGE_KEY); }catch(e){}
-  state=defaultState(); activeTab='resumen'; render();
+  if(!confirm('¿Borrar todos los datos incluido el historial? Esta acción no se puede deshacer.')) return;
+  try{ localStorage.removeItem(STORAGE_KEY); localStorage.removeItem(HISTORY_KEY); }catch(e){}
+  state=defaultState(); history=[]; activeTab='resumen'; render();
 }
 
 /* ===================== HELPERS ===================== */
@@ -465,7 +537,7 @@ function renderHeader(t){
 /* ===================== TABS ===================== */
 const TABS=[['resumen','Resumen'],['ingresos','Ingresos'],['fijos','Gastos fijos'],
   ['variables','Gastos variables'],['deudas','Deudas'],['ahorro','Ahorro'],
-  ['emergencia','Emergencia'],['proyecto','Proyecto'],['graficos','Gráficos']];
+  ['emergencia','Emergencia'],['proyecto','Proyectos'],['graficos','Gráficos'],['historial','📅 Historial']];
 function renderTabsNav(){
   return `<div class="tabs">${TABS.map(([k,l])=>`<button class="tab-btn ${activeTab===k?'active':''}" onclick="switchTab('${k}')">${l}</button>`).join('')}</div>`;
 }
@@ -536,6 +608,13 @@ function renderResumen(t){
       <div class="field"><label>% Ahorro mensual</label><input type="text" inputmode="numeric" data-fk="meta:sav" value="${state.savingsPercent}" oninput="updateSetting('savingsPercent',this.value)"></div>
       <div class="field"><label>% Inversión mensual</label><input type="text" inputmode="numeric" data-fk="meta:inv" value="${state.investPercent}" oninput="updateSetting('investPercent',this.value)"></div>
     </div>
+  </div>
+  <div style="background:linear-gradient(135deg,var(--ink) 0%,var(--ink-soft) 100%);border-radius:var(--radius);padding:20px 22px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px">
+    <div>
+      <div style="color:var(--gold-soft);font-family:'Fraunces',serif;font-size:16px;font-weight:600">¿Terminaste el mes de ${esc(state.month)}?</div>
+      <div style="color:rgba(250,246,239,0.6);font-size:12px;margin-top:3px">Se archiva en el historial y abrís un mes nuevo. Los gastos fijos, deudas y proyectos se mantienen.</div>
+    </div>
+    <button onclick="closeMonth()" style="background:var(--gold);border:none;color:var(--ink);padding:10px 20px;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap">Cerrar mes →</button>
   </div>`;
 }
 
@@ -1010,7 +1089,93 @@ function importData(){
   input.click();
 }
 
-/* ===================== RENDER PRINCIPAL ===================== */
+/* ===================== HISTORIAL ===================== */
+function renderHistorial(){
+  if(!history.length) return `
+    <h2 class="section-title">Historial de meses</h2>
+    <p class="section-sub">Acá vas a ver todos los meses archivados.</p>
+    <div class="empty-state" style="padding:40px 20px">
+      <div style="font-size:32px;margin-bottom:12px">📅</div>
+      <div style="font-weight:600;margin-bottom:6px">Todavía no hay meses archivados</div>
+      <div>Cuando termines el mes usá el botón <b>"Cerrar mes"</b> del Resumen para guardarlo acá y empezar uno nuevo.</div>
+    </div>`;
+
+  // Gráfico de barras del histórico: ingreso vs gasto
+  const histReversed = [...history].reverse(); // cronológico
+  const maxH = Math.max(...histReversed.map(h=>Math.max(h.totals.income, h.totals.committed+h.totals.varSpent)),1);
+  const barW2 = Math.min(40, 500/histReversed.length*0.6);
+  const padL=50,padR=10,padT=14,padB=50,cw=580-padL-padR,ch=180-padT-padB;
+  const gap=cw/(histReversed.length||1);
+  let histBars=[];
+  [0,.25,.5,.75,1].forEach(f=>{
+    const y=padT+ch*(1-f);
+    histBars.push(`<line x1="${padL}" y1="${y}" x2="${580-padR}" y2="${y}" stroke="#eee" stroke-width="1"/>`);
+    histBars.push(`<text x="${padL-5}" y="${y+4}" text-anchor="end" fill="#aaa" font-size="9">${fmt(maxH*f)}</text>`);
+  });
+  histReversed.forEach((h,i)=>{
+    const cx=padL+gap*i+gap/2;
+    const ih=(h.totals.income/maxH)*ch;
+    const gh=((h.totals.committed+h.totals.varSpent)/maxH)*ch;
+    histBars.push(`<rect x="${cx-barW2/2-2}" y="${padT+ch-ih}" width="${barW2+4}" height="${ih}" rx="3" fill="#7C8FC422"/>`);
+    histBars.push(`<rect x="${cx-barW2/2}" y="${padT+ch-gh}" width="${barW2}" height="${gh}" rx="3" fill="${gh>ih?'#B6452C':'#4F7A5E'}"/>`);
+    const lbl=h.month.split(' ')[0].slice(0,3);
+    histBars.push(`<text x="${cx}" y="${padT+ch+14}" text-anchor="middle" fill="#888" font-size="9">${esc(lbl)}</text>`);
+    // valor disponible
+    const rem=h.totals.remaining;
+    histBars.push(`<text x="${cx}" y="${padT+ch-ih-5}" text-anchor="middle" fill="${rem>=0?'#4F7A5E':'#B6452C'}" font-size="8" font-weight="600">${rem>=0?'+':'-'}${Math.abs(Math.round(rem/1000))}k</text>`);
+  });
+
+  const histSvg=`<svg class="chart" viewBox="0 0 580 180" xmlns="http://www.w3.org/2000/svg">${histBars.join('')}</svg>`;
+
+  const cards = history.map((h,idx)=>{
+    const rem=h.totals.remaining;
+    const varOver=(h.variable||[]).filter(v=>Number(v.spent)>Number(v.budget)&&Number(v.budget)>0);
+    return `<div class="card" style="margin-bottom:12px">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px">
+        <div>
+          <div style="font-family:'Fraunces',serif;font-size:17px;font-weight:600">${esc(h.month)}</div>
+          <div style="font-size:11px;color:var(--text-dim)">Archivado el ${new Date(h.archivedAt).toLocaleDateString('es-AR',{day:'numeric',month:'long'})}</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-family:'IBM Plex Mono',monospace;font-size:15px;font-weight:700;color:${rem>=0?'#4F7A5E':'#B6452C'}">${rem>=0?'+':''}${fmt(rem)}</span>
+          <button onclick="deleteHistoryMonth(${idx})" style="background:none;border:none;color:#ccc;font-size:13px;cursor:pointer" title="Eliminar este mes">✕</button>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px;margin-bottom:10px">
+        ${[
+          ['Ingreso',h.totals.income,'#7C8FC4'],
+          ['Gastos fijos',h.totals.fixed,'#888'],
+          ['Deudas',h.totals.debts,'#B6452C'],
+          ['Variables',h.totals.varSpent,'#E08C73'],
+          ['Ahorro',h.totals.savings,'#4F7A5E'],
+          ['Inversión',h.totals.invest,'#C9A227'],
+        ].map(([lbl,val,color])=>`<div style="background:var(--paper-dim);border-radius:7px;padding:8px 10px">
+          <div style="font-size:10px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.5px">${lbl}</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:700;color:${color};margin-top:2px">${fmt(val)}</div>
+        </div>`).join('')}
+      </div>
+      ${varOver.length?`<div style="font-size:11.5px;color:#B6452C">⚠️ Superaron el presupuesto: ${varOver.map(v=>`<b>${esc(v.name)}</b>`).join(', ')}</div>`:''}
+    </div>`;
+  }).join('');
+
+  return `<h2 class="section-title">Historial de meses</h2>
+  <p class="section-sub">${history.length} mes${history.length!==1?'es':''} archivado${history.length!==1?'s':''}.</p>
+  <div class="card">
+    <div class="card-title">Evolución mensual — ingreso (fondo claro) vs. gasto total (barra sólida)</div>
+    <div class="chart-wrap">${histSvg}</div>
+    <div class="chart-legend">
+      <span><i class="dot" style="background:#4F7A5E"></i>Gasto menor al ingreso</span>
+      <span><i class="dot" style="background:#B6452C"></i>Gasto mayor al ingreso</span>
+    </div>
+  </div>
+  ${cards}`;
+}
+
+function deleteHistoryMonth(idx){
+  if(!confirm('¿Eliminar este mes del historial?')) return;
+  history.splice(idx,1); saveHistory(); render();
+}
+
 function renderTabContent(t){
   switch(activeTab){
     case 'ingresos': return renderIngresos();
@@ -1021,6 +1186,7 @@ function renderTabContent(t){
     case 'emergencia': return renderEmergencia(t);
     case 'proyecto': return renderProyecto(t);
     case 'graficos': return renderGraficos(t);
+    case 'historial': return renderHistorial();
     default: return renderResumen(t);
   }
 }
